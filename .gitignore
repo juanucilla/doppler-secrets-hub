@@ -1,0 +1,11 @@
+*.pyc
+__pycache__/
+*.pem
+*.key
+*.crt
+*.csr
+.env
+.vscode/
+.idea/
+*.swp
+.DS_Store
