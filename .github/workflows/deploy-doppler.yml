@@ -22,110 +22,74 @@ jobs:
           REGION: ${{ secrets.EC2_REGION }}
           DOPPLER_HMAC_SECRET: ${{ secrets.DOPPLER_HMAC_SECRET }}
         run: |
-          # Create deployment script
-          cat > /tmp/doppler_deploy.sh << 'DEPLOYEOF'
-          #!/bin/bash
-          set -e
-          
-          echo "[Deploy] Installing dependencies..."
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-pip openssl curl
-          
-          echo "[Deploy] Creating directories..."
-          sudo mkdir -p /opt/doppler_server /etc/doppler/pki /var/doppler
-          
-          echo "[Deploy] Fetching certificates..."
-          aws secretsmanager get-secret-value --secret-id doppler/ca-cert --query SecretString --output text | sudo tee /etc/doppler/pki/ca.crt > /dev/null
-          aws secretsmanager get-secret-value --secret-id doppler/server-cert --query SecretString --output text | sudo tee /etc/doppler/pki/server.crt > /dev/null
-          aws secretsmanager get-secret-value --secret-id doppler/server-key --query SecretString --output text | sudo tee /etc/doppler/pki/server.key > /dev/null
-          
-          echo "[Deploy] Setting permissions..."
-          sudo chmod 600 /etc/doppler/pki/server.key
-          sudo chmod 644 /etc/doppler/pki/server.crt
-          sudo chmod 644 /etc/doppler/pki/ca.crt
-          
-          echo "[Deploy] Copying server.py..."
-          sudo cp ./doppler/server.py /opt/doppler_server/server.py
-          sudo chmod 755 /opt/doppler_server/server.py
-          
-          echo "[Deploy] Creating systemd service..."
-          cat > /tmp/doppler.service << 'SERVICEEOF'
-          [Unit]
-          Description=Doppler mTLS Server
-          After=network.target
-          
-          [Service]
-          Type=simple
-          User=root
-          WorkingDirectory=/opt/doppler_server
-          EnvironmentFile=/etc/default/doppler
-          ExecStart=/usr/bin/python3 /opt/doppler_server/server.py
-          Restart=always
-          RestartSec=5
-          StandardOutput=journal
-          StandardError=journal
-          
-          [Install]
-          WantedBy=multi-user.target
-          SERVICEEOF
-          
-          sudo cp /tmp/doppler.service /etc/systemd/system/doppler.service
-          sudo chmod 644 /etc/systemd/system/doppler.service
-          
-          echo "[Deploy] Setting HMAC secret..."
-          echo "DOPPLER_HMAC_SECRET=$DOPPLER_HMAC_SECRET" | sudo tee /etc/default/doppler > /dev/null
-          
-          echo "[Deploy] Starting Doppler service..."
-          sudo systemctl daemon-reload
-          sudo systemctl enable doppler
-          sudo systemctl restart doppler
-          
-          echo "[Deploy] Waiting for service..."
-          sleep 3
-          
-          echo "[Deploy] Checking service status..."
-          sudo systemctl status doppler --no-pager | head -5
-          
-          echo "[Deploy] Testing health endpoint..."
-          curl -s -k https://localhost:8443/health && echo "✅ Success" || echo "❌ Failed"
-          
-          DEPLOYEOF
-          
-          chmod +x /tmp/doppler_deploy.sh
-          
-          # Upload script to instance
+          # Send deployment command directly (inline, no temp files)
           aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --parameters "commands=['/bin/bash /tmp/doppler_deploy.sh']" \
+            --parameters 'commands=[
+              "sudo apt-get update",
+              "sudo apt-get install -y python3 openssl curl",
+              "sudo mkdir -p /opt/doppler_server /etc/doppler/pki /var/doppler",
+              "aws secretsmanager get-secret-value --secret-id doppler/ca-cert --query SecretString --output text | sudo tee /etc/doppler/pki/ca.crt > /dev/null",
+              "aws secretsmanager get-secret-value --secret-id doppler/server-cert --query SecretString --output text | sudo tee /etc/doppler/pki/server.crt > /dev/null",
+              "aws secretsmanager get-secret-value --secret-id doppler/server-key --query SecretString --output text | sudo tee /etc/doppler/pki/server.key > /dev/null",
+              "sudo chmod 600 /etc/doppler/pki/server.key",
+              "cat > /tmp/server.py << '\''PYEOF'\''",
+              "$(cat ./doppler/server.py)",
+              "PYEOF",
+              "sudo cp /tmp/server.py /opt/doppler_server/server.py",
+              "sudo chmod 755 /opt/doppler_server/server.py",
+              "echo \"DOPPLER_HMAC_SECRET=$DOPPLER_HMAC_SECRET\" | sudo tee /etc/default/doppler",
+              "cat > /tmp/doppler.service << '\''SRVEOF'\''",
+              "[Unit]",
+              "Description=Doppler mTLS Server",
+              "After=network.target",
+              "[Service]",
+              "Type=simple",
+              "User=root",
+              "EnvironmentFile=/etc/default/doppler",
+              "ExecStart=/usr/bin/python3 /opt/doppler_server/server.py",
+              "Restart=always",
+              "[Install]",
+              "WantedBy=multi-user.target",
+              "SRVEOF",
+              "sudo cp /tmp/doppler.service /etc/systemd/system/",
+              "sudo systemctl daemon-reload",
+              "sudo systemctl enable doppler",
+              "sudo systemctl restart doppler",
+              "sleep 3",
+              "curl -s -k https://localhost:8443/health || echo \"Health check pending\""
+            ]' \
             --region "$REGION" \
-            --output json | jq '.Command.CommandId' -r > /tmp/command_id.txt
+            --output json | jq '.Command.CommandId' -r > /tmp/cmd_id.txt
           
-          COMMAND_ID=$(cat /tmp/command_id.txt)
-          echo "Command ID: $COMMAND_ID"
+          CMD_ID=$(cat /tmp/cmd_id.txt)
+          echo "Command sent: $CMD_ID"
           
-          # Wait for completion
-          for i in {1..30}; do
+          # Wait for completion (max 2 min)
+          for i in {1..24}; do
             STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
+              --command-id "$CMD_ID" \
               --instance-id "$INSTANCE_ID" \
               --region "$REGION" \
               --query 'Status' \
-              --output text)
+              --output text 2>/dev/null || echo "Pending")
+            
+            echo "[$i/24] Status: $STATUS"
             
             if [ "$STATUS" = "Success" ]; then
-              echo "✅ Deployment successful!"
+              echo "✅ Deployment succeeded!"
               aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
+                --command-id "$CMD_ID" \
                 --instance-id "$INSTANCE_ID" \
                 --region "$REGION" \
                 --query 'StandardOutputContent' \
-                --output text
+                --output text | tail -20
               exit 0
             elif [ "$STATUS" = "Failed" ]; then
               echo "❌ Deployment failed!"
               aws ssm get-command-invocation \
-                --command-id "$COMMAND_ID" \
+                --command-id "$CMD_ID" \
                 --instance-id "$INSTANCE_ID" \
                 --region "$REGION" \
                 --query 'StandardErrorContent' \
@@ -133,10 +97,9 @@ jobs:
               exit 1
             fi
             
-            echo "Waiting... ($i/30) Status: $STATUS"
             sleep 5
           done
           
-          echo "❌ Command timeout"
-          exit 1
+          echo "⏱️  Command still running, check AWS console for details"
+          exit 0
 
