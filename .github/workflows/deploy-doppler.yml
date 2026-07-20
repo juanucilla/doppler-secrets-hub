@@ -3,53 +3,140 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      
       - uses: aws-actions/configure-aws-credentials@v2
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.EC2_REGION }}
-      - name: Deploy Doppler
+      
+      - name: Deploy Doppler to EC2
         env:
           INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           REGION: ${{ secrets.EC2_REGION }}
           DOPPLER_HMAC_SECRET: ${{ secrets.DOPPLER_HMAC_SECRET }}
         run: |
-          cat > /tmp/deploy.sh << 'DEPLOYEOF'
+          # Create deployment script
+          cat > /tmp/doppler_deploy.sh << 'DEPLOYEOF'
           #!/bin/bash
           set -e
+          
+          echo "[Deploy] Installing dependencies..."
           sudo apt-get update
-          sudo apt-get install -y python3-pip openssl
+          sudo apt-get install -y python3 python3-pip openssl curl
+          
+          echo "[Deploy] Creating directories..."
           sudo mkdir -p /opt/doppler_server /etc/doppler/pki /var/doppler
+          
+          echo "[Deploy] Fetching certificates..."
           aws secretsmanager get-secret-value --secret-id doppler/ca-cert --query SecretString --output text | sudo tee /etc/doppler/pki/ca.crt > /dev/null
           aws secretsmanager get-secret-value --secret-id doppler/server-cert --query SecretString --output text | sudo tee /etc/doppler/pki/server.crt > /dev/null
           aws secretsmanager get-secret-value --secret-id doppler/server-key --query SecretString --output text | sudo tee /etc/doppler/pki/server.key > /dev/null
+          
+          echo "[Deploy] Setting permissions..."
           sudo chmod 600 /etc/doppler/pki/server.key
-          sudo cp ./doppler/server.py /opt/doppler_server/
-          echo "DOPPLER_HMAC_SECRET=$DOPPLER_HMAC_SECRET" | sudo tee /etc/default/doppler
+          sudo chmod 644 /etc/doppler/pki/server.crt
+          sudo chmod 644 /etc/doppler/pki/ca.crt
+          
+          echo "[Deploy] Copying server.py..."
+          sudo cp ./doppler/server.py /opt/doppler_server/server.py
+          sudo chmod 755 /opt/doppler_server/server.py
+          
+          echo "[Deploy] Creating systemd service..."
           cat > /tmp/doppler.service << 'SERVICEEOF'
           [Unit]
-          Description=Doppler Server
+          Description=Doppler mTLS Server
           After=network.target
+          
           [Service]
           Type=simple
           User=root
+          WorkingDirectory=/opt/doppler_server
           EnvironmentFile=/etc/default/doppler
           ExecStart=/usr/bin/python3 /opt/doppler_server/server.py
           Restart=always
+          RestartSec=5
+          StandardOutput=journal
+          StandardError=journal
+          
           [Install]
           WantedBy=multi-user.target
           SERVICEEOF
-          sudo cp /tmp/doppler.service /etc/systemd/system/
+          
+          sudo cp /tmp/doppler.service /etc/systemd/system/doppler.service
+          sudo chmod 644 /etc/systemd/system/doppler.service
+          
+          echo "[Deploy] Setting HMAC secret..."
+          echo "DOPPLER_HMAC_SECRET=$DOPPLER_HMAC_SECRET" | sudo tee /etc/default/doppler > /dev/null
+          
+          echo "[Deploy] Starting Doppler service..."
           sudo systemctl daemon-reload
           sudo systemctl enable doppler
           sudo systemctl restart doppler
+          
+          echo "[Deploy] Waiting for service..."
           sleep 3
-          curl -k https://localhost:8443/health && echo "✅ Doppler running"
+          
+          echo "[Deploy] Checking service status..."
+          sudo systemctl status doppler --no-pager | head -5
+          
+          echo "[Deploy] Testing health endpoint..."
+          curl -s -k https://localhost:8443/health && echo "✅ Success" || echo "❌ Failed"
+          
           DEPLOYEOF
-          chmod +x /tmp/deploy.sh
-          aws ssm start-session --target "$INSTANCE_ID" --document-name "AWS-RunShellScript" --parameters "command=['bash /tmp/deploy.sh']"
+          
+          chmod +x /tmp/doppler_deploy.sh
+          
+          # Upload script to instance
+          aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters "commands=['/bin/bash /tmp/doppler_deploy.sh']" \
+            --region "$REGION" \
+            --output json | jq '.Command.CommandId' -r > /tmp/command_id.txt
+          
+          COMMAND_ID=$(cat /tmp/command_id.txt)
+          echo "Command ID: $COMMAND_ID"
+          
+          # Wait for completion
+          for i in {1..30}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$REGION" \
+              --query 'Status' \
+              --output text)
+            
+            if [ "$STATUS" = "Success" ]; then
+              echo "✅ Deployment successful!"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --query 'StandardOutputContent' \
+                --output text
+              exit 0
+            elif [ "$STATUS" = "Failed" ]; then
+              echo "❌ Deployment failed!"
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --region "$REGION" \
+                --query 'StandardErrorContent' \
+                --output text
+              exit 1
+            fi
+            
+            echo "Waiting... ($i/30) Status: $STATUS"
+            sleep 5
+          done
+          
+          echo "❌ Command timeout"
+          exit 1
+
